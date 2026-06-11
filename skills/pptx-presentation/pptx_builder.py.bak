@@ -77,68 +77,6 @@ def add_page_number(slide, num, total, theme):
                  f"{num}/{total}", font_name=theme["font_name"],
                  font_size=10, color="999999", alignment=PP_ALIGN.RIGHT)
 
-
-# ─────────────────────────────── Decorative Background ───────────────────────────────
-
-def add_decorative_shapes(slide, theme):
-    """Add geometric decorative shapes to slide background."""
-    from pptx.oxml.ns import qn
-    import math
-    
-    sw = SLIDE_W  # 13.333 inches
-    sh = SLIDE_H  # 7.5 inches
-    
-    primary = hex_to_rgb(theme["primary_color"])
-    accent = hex_to_rgb(theme["accent_color"])
-    
-    def set_alpha(shape, alpha_val):
-        """Set transparency on shape fill via XML (alpha_val = 0-100000, 0=full transparent)."""
-        spPr = shape._element.find(qn('p:spPr'))
-        if spPr is None:
-            return
-        # Find the solidFill element
-        solidFill = spPr.find(qn('a:solidFill'))
-        if solidFill is None:
-            return
-        srgbClr = solidFill.find(qn('a:srgbClr'))
-        if srgbClr is not None:
-            # Remove existing alpha if any
-            for old_alpha in srgbClr.findall(qn('a:alpha')):
-                srgbClr.remove(old_alpha)
-            alpha_elem = srgbClr.makeelement(qn('a:alpha'), {'val': str(alpha_val)})
-            srgbClr.append(alpha_elem)
-    
-    def make_shape(shape_type, left, top, width, height, color, alpha=20000):
-        shape = slide.shapes.add_shape(shape_type, left, top, width, height)
-        shape.fill.solid()
-        shape.fill.fore_color.rgb = color
-        shape.line.fill.background()  # no border
-        # move to back by sending behind other elements
-        sp = shape._element
-        sp.getparent().remove(sp)
-        slide.shapes._spTree.insert(2, sp)  # after background, before content
-        set_alpha(shape, alpha)
-        return shape
-
-    def make_circle(left, top, size, color, alpha=15000):
-        return make_shape(MSO_SHAPE.OVAL, left, top, size, size, color, alpha)
-    
-    def make_triangle(left, top, size, color, alpha=12000):
-        return make_shape(MSO_SHAPE.ISOSCELES_TRIANGLE, left, top, size, size, color, alpha)
-
-    # ── Large accent circle bottom-right ──
-    make_circle(Inches(9.5), Inches(4.5), Inches(5.0), accent, alpha=12000)
-    
-    # ── Small primary circle top-right ──
-    make_circle(Inches(11.5), Inches(-0.5), Inches(2.5), primary, alpha=10000)
-    
-    # ── Triangle bottom-left ──
-    make_triangle(Inches(-0.8), Inches(5.0), Inches(2.0), accent, alpha=8000)
-    
-    # ── Small accent circle top-left ──
-    make_circle(Inches(-0.6), Inches(-0.6), Inches(1.5), accent, alpha=9000)
-
-
 # ─────────────────────────────── Slide Builders ───────────────────────────────
 
 def build_title_slide(prs, data, theme, page_num, total):
@@ -181,7 +119,6 @@ def build_bullets_slide(prs, data, theme, page_num, total):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(slide, theme["bg_color"])
     add_accent_bar(slide, theme)
-    add_decorative_shapes(slide, theme)
 
     # title
     add_text_box(slide, Inches(0.8), Inches(0.4), Inches(11), Inches(0.8),
@@ -213,7 +150,6 @@ def build_table_slide(prs, data, theme, page_num, total):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(slide, theme["bg_color"])
     add_accent_bar(slide, theme)
-    add_decorative_shapes(slide, theme)
 
     # title
     add_text_box(slide, Inches(0.8), Inches(0.4), Inches(11), Inches(0.8),
@@ -270,7 +206,6 @@ def build_image_text_slide(prs, data, theme, page_num, total):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(slide, theme["bg_color"])
     add_accent_bar(slide, theme)
-    add_decorative_shapes(slide, theme)
 
     # title
     add_text_box(slide, Inches(0.8), Inches(0.4), Inches(11), Inches(0.8),
@@ -315,7 +250,6 @@ def build_process_slide(prs, data, theme, page_num, total):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(slide, theme["bg_color"])
     add_accent_bar(slide, theme)
-    add_decorative_shapes(slide, theme)
 
     # title
     add_text_box(slide, Inches(0.8), Inches(0.4), Inches(11), Inches(0.8),
@@ -340,7 +274,6 @@ def build_code_slide(prs, data, theme, page_num, total):
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     add_bg(slide, theme["bg_color"])
     add_accent_bar(slide, theme)
-    add_decorative_shapes(slide, theme)
 
     # title
     add_text_box(slide, Inches(0.8), Inches(0.4), Inches(11), Inches(0.8),
