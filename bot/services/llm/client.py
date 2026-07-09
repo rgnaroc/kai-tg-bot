@@ -56,6 +56,7 @@ class LLMClient:
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        reasoning_request_mode: str = "none",
     ) -> LLMResult:
         """Отправить запрос с retry и обработкой ошибок."""
         model = model or self.default_model
@@ -71,6 +72,11 @@ class LLMClient:
 
         for attempt in range(MAX_RETRIES):
             try:
+                extra_body = {}
+                if reasoning_request_mode == "thinking_param":
+                    extra_body["thinking"] = {"type": "enabled"}
+                    extra_body["reasoning_effort"] = "high"
+
                 kwargs = dict(
                     model=model,
                     messages=messages,
@@ -78,6 +84,8 @@ class LLMClient:
                 )
                 if max_tokens:
                     kwargs["max_tokens"] = max_tokens
+                if extra_body:
+                    kwargs["extra_body"] = extra_body
 
                 response = await self._client.chat.completions.create(**kwargs)
 

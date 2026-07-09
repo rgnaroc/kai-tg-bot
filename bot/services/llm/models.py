@@ -81,9 +81,10 @@ PREDEFINED_PROVIDERS: dict[str, ProviderDef] = {
         provider_type=ProviderType.OPENAI_COMPAT,
         chat_url="https://api.deepseek.com/v1/chat/completions",
         models_url="https://api.deepseek.com/v1/models",
-        default_model="deepseek-chat",
+        default_model="deepseek-v4-flash",
         api_key_url="platform.deepseek.com/api_keys",
         supports_pdf=True,
+        reasoning_request_mode="thinking_param",
     ),
     "groq": ProviderDef(
         id="groq", display_name="GroqCloud",

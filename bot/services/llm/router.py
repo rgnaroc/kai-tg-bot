@@ -169,14 +169,19 @@ class LLMRouter:
             client = self._clients[instance_id]
             model = ""
             inst = self.storage.get_instance(instance_id)
+            model = inst.model_id if inst else ""
+            reasoning_mode = "none"
             if inst:
-                model = inst.model_id
+                provider_def = self.storage.get_provider_def(inst.service_id)
+                if provider_def:
+                    reasoning_mode = provider_def.reasoning_request_mode
 
             result = await client.send(
                 prompt=prompt,
                 model=model or None,
                 system_prompt=system_prompt,
                 temperature=temperature,
+                reasoning_request_mode=reasoning_mode,
             )
 
             if not result.error:
