@@ -1,4 +1,4 @@
-"""Основной диалог: любое текстовое сообщение → LLM → ответ + память + поиск."""
+"""Основной диалог с двухшаговым поиском: AI → [search] → бот ищет → AI анализирует → ответ."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from bot.services.web_search import web_search, format_search_results
 
 logger = logging.getLogger(__name__)
 
-# Memory теги
 MEMORY_TAG_RE = re.compile(
     r'\[memory:\s*(store|learn|reinforce|forget)\s*'
     r'(?:key\s*=\s*"([^"]*)"\s*)?'
@@ -28,33 +27,25 @@ MEMORY_TAG_RE = re.compile(
 KAI_SYSTEM_PROMPT = """Ты — Kai, персональный AI-ассистент. Ты работаешь как Telegram-бот.
 
 Твоя среда:
-- Ты запущен в Docker-контейнере на VPS в Германии (Linux Debian 12, 3.8 GB RAM, 60 GB SSD)
-- Твой код написан на Python (aiogram 3 + OpenAI API)
-- Твой репозиторий: https://github.com/rgnaroc/kai-tg-bot
-- Ты живёшь на одном сервере с Open WebUI (https://ai.aiinfosec.ru)
-- У тебя 3 LLM-сервиса: DeepSeek Flash, DeepSeek Pro, Groq
+- Ты запущен в Docker-контейнере на VPS в Германии
+- Твой код на Python (aiogram 3 + OpenAI API)
+- Репозиторий: https://github.com/rgnaroc/kai-tg-bot
+- 3 LLM-сервиса: DeepSeek Flash/Pro, Groq
 
-Твой создатель — пользователь с ником rgnaroc (Alexandr Sukhanov), специалист по кибербезопасности.
-Ты лаконичный, полезный, с лёгким чувством юмора. Отвечай на русском, если не просят иначе.
+Твой создатель — rgnaroc (Alexandr Sukhanov), специалист по кибербезопасности.
+Ты лаконичный, полезный, с лёгким чувством юмора. Отвечай на русский.
 
-**Управление памятью (важно!)**
-Ты можешь запоминать информацию. Для этого включи в свой ответ тег в самом конце:
+**Память:**
+[memory: store key="..." content="..." category="FACT"]
+Категории: FACT, PREFERENCE, LEARNING, ERROR.
 
-[memory: store key="user_name" content="Александр" category="FACT"]
-
-Операции: store, learn, reinforce, forget. Категории: FACT, PREFERENCE, LEARNING, ERROR.
-Не злоупотребляй — сохраняй только важное.
-
-**Поиск в интернете (важно!)**
-Если тебе нужно узнать актуальную информацию (новости, погода, цены, документация) —
-напиши в конце ответа тег:
-
+**Поиск в интернете:**
+Если нужны актуальные данные — НЕ пиши ничего в ответ, просто напиши ТОЛЬКО тег:
 [search: запрос]
+Я выполню поиск и пришлю тебе результаты. После этого ты сможешь дать полноценный ответ.
 
-Пример: [search: погода в Берлине сегодня]
-
-После выполнения поиска я пришлю результаты отдельным сообщением.
-Используй поиск только когда действительно нужны свежие данные."""
+ВАЖНО: Не пиши никакого текста вместе с [search] — только сам тег.
+Ты получишь результаты поиска в следующем сообщении и должен будешь ответить пользователю."""
 
 
 def _chunk_text(text: str, limit: int = 4000) -> list[str]:
@@ -68,44 +59,22 @@ def _chunk_text(text: str, limit: int = 4000) -> list[str]:
 
 
 async def _process_memory_tags(text: str, memory: Memory) -> str:
-    """Обработать [memory: ...] теги."""
     cleaned = MEMORY_TAG_RE.sub("", text).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-
     for match in MEMORY_TAG_RE.finditer(text):
-        operation = match.group(1).lower()
-        key = match.group(2)
-        content = match.group(3)
-        category = match.group(4) or "FACT"
-
+        op, key, content, cat = match.group(1).lower(), match.group(2), match.group(3), match.group(4) or "FACT"
         try:
-            if operation == "store" and key:
-                await memory.store(key, content or "", category)
-                logger.info("Memory store: %s", key)
-            elif operation == "learn" and key:
-                await memory.learn(key, content or "", category)
-            elif operation == "reinforce" and key:
+            if op == "store" and key:
+                await memory.store(key, content or "", cat)
+            elif op == "learn" and key:
+                await memory.learn(key, content or "", cat)
+            elif op == "reinforce" and key:
                 await memory.reinforce(key)
-            elif operation == "forget" and key:
+            elif op == "forget" and key:
                 await memory.forget(key)
         except Exception as e:
             logger.warning("Memory op failed: %s", e)
-
     return cleaned
-
-
-async def _maybe_summarize(llm: LLMRouter, memory: Memory, user_id: int):
-    history = await memory.get_history(user_id)
-    if len(history) < 30:
-        return
-    text = "\n".join(f"{m['role']}: {m['content'][:200]}" for m in history[-20:])
-    result = await llm.send(
-        prompt=f"Суммируй этот диалог в 2-3 предложения.\n\n{text}",
-        system_prompt="Кратко суммируй диалог.",
-        temperature=0.3,
-    )
-    if result.text and not result.error:
-        await memory.save_summary(user_id, result.text, len(history))
 
 
 def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
@@ -120,34 +89,30 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
 
         await memory.add_message(user_id, "user", user_text)
 
-        # Собираем контекст
-        context_parts = []
+        # ─── Формируем контекст ─────────────────────────────────────────
+        ctx = []
         history = await memory.get_history(user_id)
 
-        # Продвинутая память
         promoted = await memory.get_promoted()
         if promoted:
-            context_parts.append("[Постоянная память о пользователе]")
+            ctx.append("[О пользователе]")
             for item in promoted:
-                context_parts.append(f"- {item.content}")
+                ctx.append(f"- {item.content}")
 
-        # Релевантные памяти
         relevant = await memory.get_relevant(user_text, limit=5)
         if relevant:
-            context_parts.append("[Релевантные воспоминания]")
+            ctx.append("[Воспоминания]")
             for item in relevant:
-                context_parts.append(f"- {item.key}: {item.content}")
+                ctx.append(f"- {item.key}: {item.content}")
 
         summary = await memory.get_summary(user_id)
         if summary:
-            context_parts.append(f"[Краткое содержание]\n{summary}")
+            ctx.append(f"[Краткое содержание]\n{summary}")
 
         for msg in history[-10:]:
-            prefix = "👤" if msg["role"] == "user" else "🤖"
-            context_parts.append(f"{prefix} {msg['content']}")
+            ctx.append(f"{'👤' if msg['role'] == 'user' else '🤖'} {msg['content']}")
 
-        prompt = "\n".join(context_parts)
-
+        prompt = "\n".join(ctx)
         current = llm.get_current()
         model_info = f" ({current.display_name}: {current.model_id})" if current else ""
         full_system = KAI_SYSTEM_PROMPT + model_info
@@ -155,52 +120,56 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
         if promoted_section:
             full_system += "\n" + promoted_section
 
-        # Запрос к LLM
+        # ─── Первый запрос к AI ─────────────────────────────────────────
         result = await llm.send(prompt=prompt, system_prompt=full_system)
+        reply = result.text if not result.error else f"⚠️ {result.error}"
+        reply = await _process_memory_tags(reply, memory)
 
-        if result.error:
-            reply = f"⚠️ {result.error}"
-        else:
-            reply = result.text
-            # Обработка memory тегов
-            reply = await _process_memory_tags(reply, memory)
-            # Обработка search тегов
-            search_queries = parse_search_tags(reply)
-            reply = remove_search_tags(reply)
-            if result.from_fallback:
-                reply = f"⚠️ *Fallback mode*\n\n{reply}"
+        # ─── Поиск ────────────────────────────────────────────────────────
+        search_queries = parse_search_tags(reply)
+        reply = remove_search_tags(reply).strip()
 
-        # Сохраняем ответ
-        await memory.add_message(user_id, "assistant", reply)
+        if search_queries:
+            # Выполняем поиск
+            for query in search_queries:
+                search_resp = await web_search(query.strip())
+                search_text = format_search_results(search_resp)
 
-        # Проверка promotion
+                # Отправляем результаты обратно AI для анализа
+                analysis_prompt = (
+                    f"Пользователь спросил: {user_text}\n\n"
+                    f"Результаты поиска:\n{search_text}\n\n"
+                    "Проанализируй эти результаты и дай пользователю "
+                    "исчерпывающий ответ на его вопрос. Если есть курс/цена — назови цифру."
+                )
+                result2 = await llm.send(prompt=analysis_prompt, system_prompt=full_system)
+                reply = result2.text if not result2.error else f"⚠️ {result2.error}"
+                reply = await _process_memory_tags(reply, memory)
+
+        # ─── Сохраняем и отправляем ─────────────────────────────────────
+        if reply:
+            await memory.add_message(user_id, "assistant", reply)
+
+        # Promotion
         try:
             for item in await memory.check_promotion():
                 await memory.promote(item.key)
-                logger.info("Promoted: %s (hit=%d)", item.key, item.hit_count)
-        except Exception as e:
-            logger.warning("Promotion check failed: %s", e)
+        except Exception:
+            pass
 
-        # Суммаризация
         if len(history) > 30:
-            await _maybe_summarize(llm, memory, user_id)
+            try:
+                hist = await memory.get_history(user_id)
+                txt = "\n".join(f"{m['role']}: {m['content'][:200]}" for m in hist[-20:])
+                res = await llm.send(prompt=f"Суммируй диалог в 2-3 предложения.\n\n{txt}",
+                                     system_prompt="Кратко суммируй.", temperature=0.3)
+                if res.text and not res.error:
+                    await memory.save_summary(user_id, res.text, len(hist))
+            except Exception:
+                pass
 
-        # Отправляем ответ
-        # Не отправляем пустые ответы (AI мог написать только [search: ...])
-        reply = reply.strip()
         if reply:
             for chunk in _chunk_text(reply, 4000):
                 await message.answer(chunk)
-
-        # Если были search-теги — выполняем поиск
-        for query in search_queries:
-            try:
-                search_resp = await web_search(query.strip())
-                search_text = format_search_results(search_resp)
-                for chunk in _chunk_text(search_text, 4000):
-                    await message.answer(chunk, disable_web_page_preview=True)
-            except Exception as e:
-                logger.error("Search failed: %s", e)
-                await message.answer(f"⚠️ Search error: {e}")
 
     return r
