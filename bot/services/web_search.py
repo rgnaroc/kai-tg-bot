@@ -108,6 +108,13 @@ async def web_search(query: str, max_results: int = 5) -> SearchResponse:
     return response
 
 
+def _clean_url(url: str) -> str:
+    """Очистить URL: декодировать percent-encoding, убрать мусор."""
+    from urllib.parse import unquote
+    url = unquote(url)
+    return url
+
+
 def format_search_results(response: SearchResponse, max_results: int = 5) -> str:
     """Отформатировать результаты поиска в текст."""
     if response.error:
@@ -118,10 +125,11 @@ def format_search_results(response: SearchResponse, max_results: int = 5) -> str
 
     lines = [f"🔍 **Search: {response.query}**\n"]
     for i, r in enumerate(response.results[:max_results], 1):
+        url = _clean_url(r.url)
         lines.append(f"{i}. **{r.title}**")
         if r.snippet:
             lines.append(f"   {r.snippet[:200]}")
-        lines.append(f"   [{r.url}]({r.url})")
+        lines.append(f"   {url}")
         lines.append("")
 
     return "\n".join(lines)
