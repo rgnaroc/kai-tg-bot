@@ -18,6 +18,7 @@ from bot.handlers.chat import setup_chat
 from bot.handlers.self_coding import setup_self_coding
 from bot.handlers.services import setup_services, register_fsm_handlers
 from bot.handlers.memory_cmd import setup_memory_commands
+from bot.handlers.search import setup_search
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +71,7 @@ async def main():
     # ВАЖНО: services ДО chat, чтобы команды ловились до fallback-хендлера
     dp.include_router(setup_services(llm))
     dp.include_router(setup_memory_commands(memory))
+    dp.include_router(setup_search())
     dp.include_router(setup_commands(llm, memory))
     dp.include_router(setup_self_coding(self_coder, git))
     dp.include_router(setup_chat(llm, memory))
