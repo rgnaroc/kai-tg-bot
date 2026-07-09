@@ -1,4 +1,4 @@
-"""Основной диалог с двухшаговым поиском: AI → [search] → бот ищет → AI анализирует → ответ."""
+"""Диалог с циклом инструментов: AI может искать, загружать страницы, переспрашивать, пока не даст ответ."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from bot.services.memory import Memory
 from bot.handlers.search import parse_search_tags, remove_search_tags
 from bot.services.web_search import web_search, format_search_results
 from bot.services.currency import format_rates_text
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -21,42 +22,27 @@ MEMORY_TAG_RE = re.compile(
     r'(?:key\s*=\s*"([^"]*)"\s*)?'
     r'(?:content\s*=\s*"([^"]*)"\s*)?'
     r'(?:category\s*=\s*"([^"]*)"\s*)?'
-    r'\]',
-    re.IGNORECASE,
+    r'\]', re.IGNORECASE,
 )
 
-KAI_SYSTEM_PROMPT = """Ты — Kai, персональный AI-ассистент. Ты работаешь как Telegram-бот.
+MAX_ROUNDS = 5  # максимум раундов поиска/загрузки
 
-Твоя среда:
-- Ты запущен в Docker-контейнере на VPS в Германии
-- Твой код на Python (aiogram 3 + OpenAI API)
-- Репозиторий: https://github.com/rgnaroc/kai-tg-bot
-- 3 LLM-сервиса: DeepSeek Flash/Pro, Groq
+TOOL_SYSTEM = """Ты — Kai, AI-ассистент с доступом к интернету.
 
-Твой создатель — rgnaroc (Alexandr Sukhanov), специалист по кибербезопасности.
-Ты лаконичный, полезный, с лёгким чувством юмора. Отвечай на русский.
+У тебя есть инструменты для получения актуальной информации. Используй их когда нужно:
 
-**Память:**
-[memory: store key="..." content="..." category="FACT"]
-Категории: FACT, PREFERENCE, LEARNING, ERROR.
+**Поиск:** [search: запрос]
+**Курсы валют:** [rates]
+**Загрузить страницу:** [fetch: https://...]
 
-**Поиск в интернете:**
-Если нужны актуальные данные — НЕ пиши ничего в ответ, просто напиши ТОЛЬКО тег:
-[search: запрос]
-Я выполню поиск и пришлю тебе результаты. После этого ты сможешь дать полноценный ответ.
+Процесс работы:
+1. Чтобы найти информацию — напиши ТОЛЬКО [search: запрос] (без лишнего текста)
+2. Чтобы загрузить страницу — напиши ТОЛЬКО [fetch: url]
+3. После получения данных можешь запросить ещё или дать ответ
+4. Когда у тебя достаточно данных — дай пользователю ответ с конкретными цифрами и ссылками
 
-ВАЖНО: Не пиши никакого текста вместе с [search] — только сам тег.
-Ты получишь результаты поиска в следующем сообщении и должен будешь ответить пользователю.
-
-**Курсы валют:**
-Если пользователь спрашивает курс валют — напиши ТОЛЬКО тег:
-[rates]
-Я верну тебе официальные курсы ЦБ РФ.
-
-**Загрузка страницы:**
-Если нужно прочитать конкретную страницу — напиши ТОЛЬКО тег:
-[fetch: https://example.com]
-Я загружу содержимое и отдам тебе на анализ.""" 
+ВАЖНО: Каждый тег пиши отдельно, без дополнительного текста.
+Не пиши [search] вместе с [fetch] — сначала поищи, выбери лучшие ссылки, потом загружай."""
 
 
 def _chunk_text(text: str, limit: int = 4000) -> list[str]:
@@ -83,9 +69,62 @@ async def _process_memory_tags(text: str, memory: Memory) -> str:
                 await memory.reinforce(key)
             elif op == "forget" and key:
                 await memory.forget(key)
-        except Exception as e:
-            logger.warning("Memory op failed: %s", e)
+        except Exception:
+            pass
     return cleaned
+
+
+async def _execute_tools(text: str, user_text: str, full_system: str, llm: LLMRouter) -> str:
+    """Выполнить все инструменты из текста AI и вернуть ответ."""
+
+    # [rates]
+    if "[rates]" in text:
+        text = text.replace("[rates]", "").strip()
+        rates_text = await format_rates_text()
+        return await llm.send(
+            prompt=f"Вопрос: {user_text}\n\n{rates_text}\n\nОтветь с цифрами.",
+            system_prompt=full_system,
+        )
+
+    # [search: ...]
+    search_queries = parse_search_tags(text)
+    if search_queries:
+        text = remove_search_tags(text).strip()
+        for query in search_queries:
+            search_resp = await web_search(query.strip())
+            search_text = format_search_results(search_resp)
+            return await llm.send(
+                prompt=f"Вопрос: {user_text}\n\nРезультаты поиска:\n{search_text}\n\n"
+                       f"Если среди результатов есть полезные ссылки — загрузи их через [fetch: url]. "
+                       f"Если данных достаточно — дай ответ.",
+                system_prompt=full_system,
+            )
+
+    # [fetch: url]
+    fetch_match = re.search(r'\[fetch:\s*(https?://[^\]]+)\]', text)
+    if fetch_match:
+        url = fetch_match.group(1)
+        text = re.sub(r'\[fetch:\s*https?://[^\]]+\]', '', text).strip()
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                fr = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                raw = fr.text
+                # Очищаем HTML от тегов для читаемости
+                import html
+                clean = re.sub(r'<[^>]+>', ' ', raw)
+                clean = re.sub(r'\s+', ' ', clean).strip()[:5000]
+            return await llm.send(
+                prompt=f"Вопрос: {user_text}\n\nСодержимое {url}:\n{clean}\n\n"
+                       f"Проанализируй и дай ответ. Если нужно больше данных — используй [search] снова.",
+                system_prompt=full_system,
+            )
+        except Exception as e:
+            return await llm.send(
+                prompt=f"Вопрос: {user_text}\n\nОшибка загрузки {url}: {e}\n\nПопробуй другой источник через [search].",
+                system_prompt=full_system,
+            )
+
+    return None  # нет инструментов
 
 
 def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
@@ -100,7 +139,7 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
 
         await memory.add_message(user_id, "user", user_text)
 
-        # ─── Формируем контекст ─────────────────────────────────────────
+        # ─── Контекст ─────────────────────────────────────────────────────
         ctx = []
         history = await memory.get_history(user_id)
 
@@ -126,70 +165,59 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
         prompt = "\n".join(ctx)
         current = llm.get_current()
         model_info = f" ({current.display_name}: {current.model_id})" if current else ""
-        full_system = KAI_SYSTEM_PROMPT + model_info
+        full_system = TOOL_SYSTEM + model_info
         promoted_section = await memory.format_promoted_section()
         if promoted_section:
             full_system += "\n" + promoted_section
 
-        # ─── Первый запрос к AI ─────────────────────────────────────────
-        result = await llm.send(prompt=prompt, system_prompt=full_system)
-        reply = result.text if not result.error else f"⚠️ {result.error}"
-        reply = await _process_memory_tags(reply, memory)
+        # ─── Основной цикл ────────────────────────────────────────────────
+        current_prompt = prompt
+        final_text = ""
 
-        # ─── Поиск ────────────────────────────────────────────────────────
-        search_queries = parse_search_tags(reply)
-        reply = remove_search_tags(reply).strip()
-
-        # ─── Rates ──────────────────────────────────────────────────────────
-        if "[rates]" in reply:
-            reply = reply.replace("[rates]", "").strip()
-            rates_text = await format_rates_text()
-            result_rates = await llm.send(
-                prompt=f"Пользователь спросил: {user_text}\n\n{rates_text}\n\nДай ответ с конкретными цифрами.",
+        for round_num in range(MAX_ROUNDS):
+            result = await llm.send(
+                prompt=current_prompt,
                 system_prompt=full_system,
             )
-            reply = result_rates.text if not result_rates.error else rates_text
+            reply = result.text if not result.error else f"⚠️ {result.error}"
+
+            # Memory
             reply = await _process_memory_tags(reply, memory)
 
-        # ─── Fetch URL ────────────────────────────────────────────────────
-        fetch_match = re.search(r'\[fetch:\s*(https?://[^\]]+)\]', reply)
-        if fetch_match:
-            url = fetch_match.group(1)
-            reply = re.sub(r'\[fetch:\s*https?://[^\]]+\]', '', reply).strip()
-            import httpx
-            try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                    fr = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                    content_text = fr.text[:3000]  # первые 3000 символов
-                result_fetch = await llm.send(
-                    prompt=f"Пользователь спросил: {user_text}\n\nСодержимое страницы {url}:\n{content_text}\n\nПроанализируй и дай ответ.",
+            # Проверяем, есть ли инструменты
+            tool_result = await _execute_tools(reply, user_text, full_system, llm)
+
+            if tool_result is None:
+                # Нет инструментов — финальный ответ
+                final_text = reply
+                break
+
+            # Есть инструменты — результат идёт как новый промпт для AI
+            if round_num == MAX_ROUNDS - 1:
+                # Последний раунд — форсируем ответ без инструментов
+                force = await llm.send(
+                    prompt=f"Вопрос: {user_text}\n\n"
+                           f"Результаты поиска/загрузки:\n{tool_result.text}\n\n"
+                           f"Дай финальный ответ. Больше никаких [search] или [fetch].",
                     system_prompt=full_system,
                 )
-                reply = result_fetch.text if not result_fetch.error else f"Не удалось загрузить {url}"
-                reply = await _process_memory_tags(reply, memory)
-            except Exception as e:
-                reply = f"⚠️ Ошибка загрузки {url}: {e}"
+                final_text = force.text if not force.error else tool_result.text
+                final_text = await _process_memory_tags(final_text, memory)
+                break
 
-        if search_queries:
-            # Выполняем поиск
-            for query in search_queries:
-                search_resp = await web_search(query.strip())
-                search_text = format_search_results(search_resp)
+            # Продолжаем цикл с результатами инструментов
+            current_prompt = (
+                f"Вопрос пользователя: {user_text}\n\n"
+                f"Результаты предыдущего шага:\n{tool_result.text}\n\n"
+                f"Если у тебя достаточно данных — ответь пользователю.\n"
+                f"Если нет — используй [search] или [fetch] для уточнения."
+            )
 
-                # Отправляем результаты обратно AI для анализа
-                analysis_prompt = (
-                    f"Пользователь спросил: {user_text}\n\n"
-                    f"Результаты поиска:\n{search_text}\n\n"
-                    "Проанализируй эти результаты и дай пользователю "
-                    "исчерпывающий ответ на его вопрос. Если есть курс/цена — назови цифру."
-                )
-                result2 = await llm.send(prompt=analysis_prompt, system_prompt=full_system)
-                reply = result2.text if not result2.error else f"⚠️ {result2.error}"
-                reply = await _process_memory_tags(reply, memory)
+        # ─── Финал ────────────────────────────────────────────────────────
+        if not final_text:
+            final_text = "⚠️ Не удалось получить ответ."
 
-        # ─── Сохраняем и отправляем ─────────────────────────────────────
-        if reply:
-            await memory.add_message(user_id, "assistant", reply)
+        await memory.add_message(user_id, "assistant", final_text)
 
         # Promotion
         try:
@@ -198,19 +226,19 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
         except Exception:
             pass
 
+        # Summary
         if len(history) > 30:
             try:
                 hist = await memory.get_history(user_id)
                 txt = "\n".join(f"{m['role']}: {m['content'][:200]}" for m in hist[-20:])
-                res = await llm.send(prompt=f"Суммируй диалог в 2-3 предложения.\n\n{txt}",
-                                     system_prompt="Кратко суммируй.", temperature=0.3)
+                res = await llm.send(prompt=f"Суммируй диалог.\n\n{txt}",
+                                     system_prompt="Кратко.", temperature=0.3)
                 if res.text and not res.error:
                     await memory.save_summary(user_id, res.text, len(hist))
             except Exception:
                 pass
 
-        if reply:
-            for chunk in _chunk_text(reply, 4000):
-                await message.answer(chunk)
+        for chunk in _chunk_text(final_text, 4000):
+            await message.answer(chunk)
 
     return r
