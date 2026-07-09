@@ -66,10 +66,11 @@ async def main():
     )
     dp = Dispatcher()
 
+    # ВАЖНО: services ДО chat, чтобы команды ловились до fallback-хендлера
+    dp.include_router(setup_services(llm))
     dp.include_router(setup_commands(llm, memory))
     dp.include_router(setup_self_coding(self_coder, git))
     dp.include_router(setup_chat(llm, memory))
-    dp.include_router(setup_services(llm))
 
     # Регистрируем FSM-хендлеры на уровне диспетчера
     register_fsm_handlers(dp, llm)
