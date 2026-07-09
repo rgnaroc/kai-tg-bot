@@ -186,8 +186,11 @@ def setup_chat(llm: LLMRouter, memory: Memory) -> Router:
             await _maybe_summarize(llm, memory, user_id)
 
         # Отправляем ответ
-        for chunk in _chunk_text(reply, 4000):
-            await message.answer(chunk)
+        # Не отправляем пустые ответы (AI мог написать только [search: ...])
+        reply = reply.strip()
+        if reply:
+            for chunk in _chunk_text(reply, 4000):
+                await message.answer(chunk)
 
         # Если были search-теги — выполняем поиск
         for query in search_queries:
