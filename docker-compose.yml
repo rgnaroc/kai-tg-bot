@@ -1,0 +1,11 @@
+services:
+  kai-bot:
+    build: .
+    container_name: kai-tg-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./.git:/app/.git:ro  # только чтение для git log
+    network_mode: host  # тот же хост, что и Open WebUI
