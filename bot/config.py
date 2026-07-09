@@ -1,4 +1,4 @@
-"""Конфигурация Kai TG Bot. Все чувствительные данные через .env."""
+"""Конфигурация Kai TG Bot."""
 
 import os
 from pathlib import Path
@@ -9,51 +9,22 @@ load_dotenv()
 # --- Пути ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = PROJECT_ROOT / "skills"
+DATA_DIR = PROJECT_ROOT / "data"
 
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 raw = os.getenv("TELEGRAM_ADMIN_IDS", "")
 TELEGRAM_ADMIN_IDS = [int(x) for x in raw.split(",") if x.strip()]
 
-# --- LLM Providers ---
-LLM_PROVIDERS = {
-    "deepseek": {
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "api_key": os.getenv("DEEPSEEK_API_KEY", ""),
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "default": "deepseek-chat",
-        "description": "DeepSeek API",
-    },
-    "groq": {
-        "base_url": os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
-        "api_key": os.getenv("GROQ_API_KEY", ""),
-        "models": [
-            "llama-3.3-70b-versatile",
-            "qwen/qwen3-32b",
-            "qwen/qwen3.6-27b",
-        ],
-        "default": "llama-3.3-70b-versatile",
-        "description": "Groq (быстрый, 300+ t/s)",
-    },
-    "openwebui": {
-        "base_url": os.getenv("OWUI_BASE_URL", "https://ai.aiinfosec.ru/api"),
-        "api_key": os.getenv("OWUI_API_KEY", ""),
-        "models": [],  # загружаются динамически
-        "default": "deepseek-chat",
-        "description": "Open WebUI на германском VPS",
-    },
-}
-
-# Провайдер по умолчанию
-DEFAULT_PROVIDER = os.getenv("DEFAULT_LLM_PROVIDER", "deepseek")
-DEFAULT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "deepseek-chat")
+# --- LLM Services ---
+SERVICES_DB_PATH = DATA_DIR / "services.db"
 
 # --- Память ---
-MEMORY_DB_PATH = PROJECT_ROOT / "data" / "memory.db"
-MAX_HISTORY_MESSAGES = 50  # сколько сообщений хранить в контексте
+MEMORY_DB_PATH = DATA_DIR / "memory.db"
+MAX_HISTORY_MESSAGES = 50
 
 # --- Self-Coding ---
 GIT_REPO_PATH = PROJECT_ROOT
 GIT_REMOTE = "origin"
 GIT_BRANCH = "main"
-SELF_CODE_REVIEW_CRON = "0 3 * * *"  # ежедневно в 3:00
+SELF_CODE_REVIEW_CRON = "0 3 * * *"

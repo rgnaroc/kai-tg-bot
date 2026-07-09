@@ -1,114 +1,328 @@
-"""LLM Router — выбирает провайдера, переключает по команде юзера."""
+"""LLM Router — динамическое управление провайдерами с failover (как в Kai 9000)."""
+
+from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 
-from bot.config import LLM_PROVIDERS, DEFAULT_PROVIDER, DEFAULT_MODEL
-from bot.services.llm.base import BaseLLMClient, LLMResponse
-from bot.services.llm.openai_compat import OpenAICompatClient
+from bot.services.llm.client import LLMClient
+from bot.services.llm.models import (
+    PREDEFINED_PROVIDERS, OPENAI_COMPATIBLE, ConnectionError_,
+    LLMResult, ProviderDef, ProviderType, RateLimitError, ServiceInstance,
+)
+from bot.services.llm.storage import ServiceStorage
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ProviderInfo:
-    name: str
-    description: str
-    models: list[str]
-    default_model: str
-    is_available: bool
+    """Информация о провайдере для пользователя."""
+    id: str
+    display_name: str
+    model_id: str
+    is_active: bool
+    priority: int
+    is_online: bool = True
 
 
-@dataclass
 class LLMRouter:
-    """Хранит текущего провайдера и умеет переключаться."""
+    """Маршрутизатор с failover — если один провайдер упал, переключает на следующий."""
 
-    current_provider: str = DEFAULT_PROVIDER
-    current_model: str = DEFAULT_MODEL
-    _clients: dict[str, BaseLLMClient] = field(default_factory=dict)
-    _available_providers: dict[str, ProviderInfo] = field(default_factory=dict)
-
-    def __post_init__(self):
+    def __init__(self, storage: ServiceStorage):
+        self.storage = storage
+        self._clients: dict[str, LLMClient] = {}
+        self._current_id: str = ""  # ID текущего активного инстанса
         self._init_clients()
 
     def _init_clients(self):
-        """Создать клиенты для всех сконфигурированных провайдеров."""
-        for name, cfg in LLM_PROVIDERS.items():
-            api_key = cfg.get("api_key", "")
-            base_url = cfg.get("base_url", "")
-            if not api_key:
-                logger.warning("Провайдер %s: нет API ключа, пропущен", name)
+        """Инициализировать клиенты из БД."""
+        self._clients = {}
+        instances = self.storage.list_instances()
+        for inst in instances:
+            if not inst.is_active:
                 continue
+            client = self._build_client(inst)
+            if client:
+                self._clients[inst.id] = client
 
-            self._clients[name] = OpenAICompatClient(
-                base_url=base_url,
-                api_key=api_key,
-                default_model=cfg.get("default", ""),
-            )
-            self._available_providers[name] = ProviderInfo(
-                name=name,
-                description=cfg.get("description", name),
-                models=cfg.get("models", []),
-                default_model=cfg.get("default", ""),
-                is_available=True,
-            )
-            logger.info("Провайдер %s: готов (%s)", name, cfg.get("default", ""))
+        # Если нет ни одного клиента — пробуем из старого config.py (миграция)
+        if not self._clients:
+            self._migrate_from_env()
 
-    def get_client(self) -> BaseLLMClient:
-        """Получить текущего клиента."""
-        if self.current_provider not in self._clients:
-            logger.warning(
-                "Провайдер %s недоступен, переключаю на %s",
-                self.current_provider, DEFAULT_PROVIDER,
-            )
-            self.current_provider = DEFAULT_PROVIDER
-            self.current_model = DEFAULT_MODEL
-        return self._clients[self.current_provider]
+        # Выбрать первый активный как текущий
+        if self._clients and not self._current_id:
+            self._current_id = list(self._clients.keys())[0]
 
-    async def send(self, prompt: str, system_prompt: str | None = None,
-                   temperature: float = 0.7) -> LLMResponse:
-        """Отправить запрос через текущего провайдера."""
-        client = self.get_client()
-        return await client.send(
-            prompt=prompt,
-            model=self.current_model,
-            system_prompt=system_prompt,
-            temperature=temperature,
+    def _migrate_from_env(self):
+        """Миграция провайдеров из .env (если БД пуста и есть DEEPSEEK_API_KEY)."""
+        import os
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
+        groq_key = os.getenv("GROQ_API_KEY", "")
+        owui_key = os.getenv("OWUI_API_KEY", "")
+
+        if deepseek_key:
+            inst = ServiceInstance(
+                id="deepseek",
+                service_id="deepseek",
+                display_name="DeepSeek",
+                api_key=deepseek_key,
+                base_url="https://api.deepseek.com/v1",
+                model_id=os.getenv("DEFAULT_LLM_MODEL", "deepseek-chat"),
+                priority=0,
+            )
+            self.storage.add_instance(inst)
+            if client := self._build_client(inst):
+                self._clients[inst.id] = client
+
+        if groq_key:
+            inst = ServiceInstance(
+                id="groq",
+                service_id="groq",
+                display_name="GroqCloud",
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                model_id="llama-3.3-70b-versatile",
+                priority=1,
+            )
+            self.storage.add_instance(inst)
+            if client := self._build_client(inst):
+                self._clients[inst.id] = client
+
+        if owui_key:
+            base = os.getenv("OWUI_BASE_URL", "https://ai.aiinfosec.ru/api")
+            inst = ServiceInstance(
+                id="openwebui",
+                service_id="openai-compatible",
+                display_name="Open WebUI",
+                api_key=owui_key,
+                base_url=base,
+                model_id="deepseek-chat",
+                priority=2,
+            )
+            self.storage.add_instance(inst)
+            if client := self._build_client(inst):
+                self._clients[inst.id] = client
+
+        if self._clients:
+            logger.info("Migrated %d providers from .env to DB", len(self._clients))
+            self._current_id = list(self._clients.keys())[0]
+
+    def _build_client(self, inst: ServiceInstance) -> Optional[LLMClient]:
+        """Создать клиент для инстанса."""
+        provider_def = self.storage.get_provider_def(inst.service_id)
+        if not provider_def:
+            logger.warning("Unknown service_id: %s", inst.service_id)
+            return None
+
+        # Определить URL
+        if inst.service_id == "openai-compatible" or inst.base_url:
+            base_url = inst.base_url or provider_def.chat_url
+        else:
+            base_url = provider_def.chat_url.rstrip("/chat/completions").rstrip("/v1")
+
+        # Для openai-compatible добавляем /v1 если нужно
+        if not base_url.endswith("/v1") and inst.service_id == "openai-compatible":
+            base_url = base_url.rstrip("/") + "/v1"
+
+        name = inst.display_name or inst.id
+        return LLMClient(
+            instance_id=inst.id,
+            base_url=base_url,
+            api_key=inst.api_key,
+            default_model=inst.model_id or provider_def.default_model,
+            provider_name=name,
         )
 
-    def switch(self, provider: str, model: str | None = None) -> tuple[bool, str]:
-        """Переключить провайдера и/или модель. Возвращает (успех, сообщение)."""
-        # Формат: "groq:llama-3.3-70b" или просто "deepseek"
-        if ":" in provider:
-            prov, _, mod = provider.partition(":")
-            provider, model = prov, mod
+    # ─── Основной метод ─────────────────────────────────────────────────────
 
-        if provider not in self._available_providers:
-            available = ", ".join(self._available_providers.keys())
-            return False, f"Провайдер «{provider}» недоступен. Доступны: {available}"
+    async def send(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        preferred_instance: Optional[str] = None,
+    ) -> LLMResult:
+        """Отправить запрос с failover между провайдерами."""
+        # Собираем порядок провайдеров для попытки
+        candidates = []
 
-        info = self._available_providers[provider]
-        chosen_model = model or info.default_model
+        if preferred_instance and preferred_instance in self._clients:
+            candidates.append(preferred_instance)
 
-        if chosen_model not in info.models and info.models:
-            models = ", ".join(info.models)
-            return False, f"Модель «{chosen_model}» не найдена у {provider}. Доступны: {models}"
+        if self._current_id and self._current_id not in candidates:
+            candidates.append(self._current_id)
 
-        self.current_provider = provider
-        self.current_model = chosen_model
-        return True, f"✅ Переключён на {provider}:{chosen_model}"
+        # Остальные по priority
+        for inst in self.storage.list_instances():
+            if inst.id not in candidates and inst.is_active and inst.id in self._clients:
+                candidates.append(inst.id)
 
-    def list_providers(self) -> str:
-        """Сформировать красивый список провайдеров для /model."""
-        lines = [f"📌 Текущий: **{self.current_provider}:{self.current_model}**\n"]
-        for name, info in self._available_providers.items():
-            marker = "➤" if name == self.current_provider else " "
-            lines.append(f"{marker} **{name}** — {info.description}")
-            for m in info.models:
-                cm = " ← текущая" if name == self.current_provider and m == self.current_model else ""
-                lines.append(f"     • `{m}`{cm}")
-        return "\n".join(lines)
+        if not candidates:
+            return LLMResult(
+                text="", error="No active LLM services configured. Use /addservice to add one.",
+            )
 
-    def get_current_info(self) -> str:
-        """Короткая строка: текущий провайдер и модель."""
-        return f"{self.current_provider}:{self.current_model}"
+        errors = []
+        for idx, instance_id in enumerate(candidates):
+            client = self._clients[instance_id]
+            model = ""
+            inst = self.storage.get_instance(instance_id)
+            if inst:
+                model = inst.model_id
+
+            result = await client.send(
+                prompt=prompt,
+                model=model or None,
+                system_prompt=system_prompt,
+                temperature=temperature,
+            )
+
+            if not result.error:
+                # Успех!
+                if idx > 0:
+                    result.from_fallback = True
+                    result.text = f"[Fallback: {result.provider}]\n\n{result.text}"
+                # Запомнить текущий
+                self._current_id = instance_id
+                return result
+
+            errors.append(f"{result.provider}: {result.error}")
+            logger.warning(
+                "Provider %s failed (%d/%d): %s",
+                instance_id, idx + 1, len(candidates), result.error,
+            )
+
+        # Все провайдеры упали
+        error_detail = " | ".join(errors[:3])
+        return LLMResult(
+            text="",
+            error=f"All providers failed: {error_detail}",
+        )
+
+    # ─── Управление ─────────────────────────────────────────────────────────
+
+    async def add_service(
+        self,
+        service_id: str,
+        api_key: str = "",
+        base_url: str = "",
+        model_id: str = "",
+        display_name: str = "",
+    ) -> tuple[bool, str]:
+        """Добавить новый сервис. Возвращает (успех, сообщение)."""
+        provider_def = self.storage.get_provider_def(service_id)
+        if not provider_def:
+            return False, f"Unknown provider: {service_id}"
+
+        if not display_name:
+            display_name = provider_def.display_name
+
+        instance_id = self.storage.generate_instance_id(service_id)
+
+        # Для openai-compatible — base_url обязателен
+        if service_id == "openai-compatible" and not base_url:
+            return False, "OpenAI-Compatible requires a Base URL"
+
+        priority = self.storage.next_priority()
+
+        inst = ServiceInstance(
+            id=instance_id,
+            service_id=service_id,
+            display_name=display_name,
+            api_key=api_key,
+            base_url=base_url,
+            model_id=model_id or provider_def.default_model,
+            priority=priority,
+        )
+
+        if self.storage.add_instance(inst):
+            client = self._build_client(inst)
+            if client:
+                self._clients[instance_id] = client
+                self._current_id = instance_id
+                return True, f"✅ Added {display_name} ({instance_id})"
+            else:
+                self.storage.remove_instance(instance_id)
+                return False, f"Failed to create client for {service_id}"
+        else:
+            return False, f"Instance {instance_id} already exists"
+
+    def remove_service(self, instance_id: str) -> tuple[bool, str]:
+        """Удалить сервис."""
+        if instance_id not in self._clients:
+            return False, f"Unknown instance: {instance_id}"
+
+        self._clients.pop(instance_id, None)
+        self.storage.remove_instance(instance_id)
+
+        if self._current_id == instance_id:
+            self._current_id = list(self._clients.keys())[0] if self._clients else ""
+
+        return True, f"Removed {instance_id}"
+
+    def switch(self, instance_id: str) -> tuple[bool, str]:
+        """Переключить текущий сервис."""
+        if instance_id not in self._clients:
+            available = ", ".join(self._clients.keys())
+            return False, f"Instance '{instance_id}' not found. Available: {available}"
+        self._current_id = instance_id
+        inst = self.storage.get_instance(instance_id)
+        name = inst.display_name if inst else instance_id
+        model = inst.model_id if inst else ""
+        return True, f"✅ Switched to {name} ({model})"
+
+    # ─── Информация ─────────────────────────────────────────────────────────
+
+    def list_providers(self) -> list[ProviderInfo]:
+        """Список всех подключенных провайдеров."""
+        result = []
+        for inst in self.storage.list_instances():
+            result.append(ProviderInfo(
+                id=inst.id,
+                display_name=inst.display_name,
+                model_id=inst.model_id,
+                is_active=inst.is_active,
+                priority=inst.priority,
+                is_online=inst.id in self._clients,
+            ))
+        return result
+
+    def format_providers_text(self) -> str:
+        """Красивое текстовое описание для Telegram."""
+        lines = []
+        instances = self.storage.list_instances()
+
+        if not instances:
+            return "No services configured. Use /addservice to add one."
+
+        for inst in instances:
+            marker = "🟢" if inst.id == self._current_id else "⚪"
+            if not inst.is_active:
+                marker = "🔴"
+            status = "online" if inst.id in self._clients else "offline"
+            model = inst.model_id or "—"
+            lines.append(
+                f"{marker} **{inst.display_name}** (`{inst.id}`)\n"
+                f"   Model: `{model}` | Status: {status}"
+            )
+
+        lines.insert(0, f"📌 **Current:** `{self._current_id}`\n")
+        return "\n\n".join(lines)
+
+    def get_current(self) -> Optional[ProviderInfo]:
+        """Текущий активный провайдер."""
+        if not self._current_id:
+            return None
+        inst = self.storage.get_instance(self._current_id)
+        if not inst:
+            return None
+        return ProviderInfo(
+            id=inst.id,
+            display_name=inst.display_name,
+            model_id=inst.model_id,
+            is_active=inst.is_active,
+            priority=inst.priority,
+            is_online=inst.id in self._clients,
+        )
