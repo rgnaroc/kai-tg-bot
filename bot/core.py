@@ -8,10 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
-from bot.config import (
-    TELEGRAM_BOT_TOKEN,
-    TELEGRAM_ADMIN_IDS,
-)
+from bot.config import TELEGRAM_BOT_TOKEN
 from bot.services.llm.router import LLMRouter
 from bot.services.memory import Memory
 from bot.services.git_manager import GitManager
@@ -28,12 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 async def main():
-    # Проверяем токен
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN не задан! Создай .env файл.")
         sys.exit(1)
 
-    # Инициализируем компоненты
     logger.info("Запуск Kai TG Bot...")
 
     # LLM Router
@@ -44,9 +39,13 @@ async def main():
     memory = Memory()
     await memory.init()
 
-    # Git
+    # Git (опционально)
     git = GitManager()
-    logger.info("Git: %s (%s)", git.repo_path, "clean" if git.is_clean() else "dirty")
+    if git.available:
+        logger.info("Git: %s (%s)", git.repo_path,
+                     "clean" if git.is_clean() else "dirty")
+    else:
+        logger.warning("Git недоступен — /improve и /apply не будут работать")
 
     # Self-Coder
     self_coder = SelfCoder(llm=llm, git=git)
@@ -58,7 +57,6 @@ async def main():
     )
     dp = Dispatcher()
 
-    # Регистрируем хендлеры (порядок важен: команды → чат)
     dp.include_router(setup_commands(llm, memory))
     dp.include_router(setup_self_coding(self_coder, git))
     dp.include_router(setup_chat(llm, memory))
