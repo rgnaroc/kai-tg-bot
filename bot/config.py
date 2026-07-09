@@ -12,7 +12,8 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_ADMIN_IDS = list(map(int, os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")))
+raw = os.getenv("TELEGRAM_ADMIN_IDS", "")
+TELEGRAM_ADMIN_IDS = [int(x) for x in raw.split(",") if x.strip()]
 
 # --- LLM Providers ---
 LLM_PROVIDERS = {
