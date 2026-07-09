@@ -6,6 +6,7 @@ services:
     env_file:
       - .env
     volumes:
+      - ./bot:/app/bot       # код подтягивается с хоста
       - ./data:/app/data
-      - ./.git:/app/.git:ro  # только чтение для git log
-    network_mode: host  # тот же хост, что и Open WebUI
+      - ./.git:/app/.git:rw
+    network_mode: host
